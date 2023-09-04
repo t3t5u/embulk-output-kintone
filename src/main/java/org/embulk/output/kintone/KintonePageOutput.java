@@ -7,28 +7,34 @@ import com.kintone.client.model.record.FieldType;
 import com.kintone.client.model.record.Record;
 import com.kintone.client.model.record.RecordForUpdate;
 import com.kintone.client.model.record.UpdateKey;
+import java.lang.invoke.MethodHandles;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.embulk.config.TaskReport;
-import org.embulk.spi.Column;
 import org.embulk.spi.Exec;
 import org.embulk.spi.Page;
 import org.embulk.spi.PageReader;
 import org.embulk.spi.Schema;
 import org.embulk.spi.TransactionalPageOutput;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class KintonePageOutput implements TransactionalPageOutput {
-  public static final int UPSERT_BATCH_SIZE = 10000;
-  public static final int CHUNK_SIZE = 100;
-  private final PageReader pageReader;
+  private static final Logger LOGGER =
+      LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+  private static final int UPSERT_BATCH_SIZE = 10000;
+  private static final int CHUNK_SIZE = 100;
   private final PluginTask task;
+  private final PageReader reader;
   private KintoneClient client;
 
   public KintonePageOutput(PluginTask task, Schema schema) {
-    this.pageReader = new PageReader(schema);
     this.task = task;
+    reader = new PageReader(schema);
   }
 
   @Override
@@ -56,11 +62,11 @@ public class KintonePageOutput implements TransactionalPageOutput {
 
   @Override
   public void close() {
-    if (this.client == null) {
+    if (client == null) {
       return;
     }
     try {
-      this.client.close();
+      client.close();
     } catch (Exception e) {
       throw new RuntimeException("kintone throw exception", e);
     }
@@ -76,10 +82,6 @@ public class KintonePageOutput implements TransactionalPageOutput {
     return Exec.newTaskReport();
   }
 
-  public interface Consumer<T> {
-    void accept(T t);
-  }
-
   public void connect(final PluginTask task) {
     KintoneClientBuilder builder = KintoneClientBuilder.create("https://" + task.getDomain());
     if (task.getGuestSpaceId().isPresent()) {
@@ -88,19 +90,17 @@ public class KintonePageOutput implements TransactionalPageOutput {
     if (task.getBasicAuthUsername().isPresent() && task.getBasicAuthPassword().isPresent()) {
       builder.withBasicAuth(task.getBasicAuthUsername().get(), task.getBasicAuthPassword().get());
     }
-
     if (task.getUsername().isPresent() && task.getPassword().isPresent()) {
-      this.client =
-          builder.authByPassword(task.getUsername().get(), task.getPassword().get()).build();
+      client = builder.authByPassword(task.getUsername().get(), task.getPassword().get()).build();
     } else if (task.getToken().isPresent()) {
-      this.client = builder.authByApiToken(task.getToken().get()).build();
+      client = builder.authByApiToken(task.getToken().get()).build();
     }
   }
 
   private void execute(Consumer<KintoneClient> operation) {
     connect(task);
-    if (this.client != null) {
-      operation.accept(this.client);
+    if (client != null) {
+      operation.accept(client);
     } else {
       throw new RuntimeException("Failed to connect to kintone.");
     }
@@ -111,23 +111,21 @@ public class KintonePageOutput implements TransactionalPageOutput {
         client -> {
           try {
             ArrayList<Record> records = new ArrayList<>();
-            pageReader.setPage(page);
+            reader.setPage(page);
             KintoneColumnVisitor visitor =
-                new KintoneColumnVisitor(pageReader, task.getColumnOptions());
-            while (pageReader.nextRecord()) {
+                new KintoneColumnVisitor(
+                    reader, task.getColumnOptions(), task.getPreferNulls(), task.getIgnoreNulls());
+            while (reader.nextRecord()) {
               Record record = new Record();
               visitor.setRecord(record);
-              for (Column column : pageReader.getSchema().getColumns()) {
-                column.visit(visitor);
-              }
-
+              reader.getSchema().visitColumns(visitor);
               records.add(record);
               if (records.size() == CHUNK_SIZE) {
                 client.record().addRecords(task.getAppId(), records);
                 records.clear();
               }
             }
-            if (records.size() > 0) {
+            if (!records.isEmpty()) {
               client.record().addRecords(task.getAppId(), records);
             }
           } catch (Exception e) {
@@ -141,36 +139,34 @@ public class KintonePageOutput implements TransactionalPageOutput {
         client -> {
           try {
             ArrayList<RecordForUpdate> updateRecords = new ArrayList<>();
-            pageReader.setPage(page);
-
+            reader.setPage(page);
             KintoneColumnVisitor visitor =
                 new KintoneColumnVisitor(
-                    pageReader,
+                    reader,
                     task.getColumnOptions(),
+                    task.getPreferNulls(),
+                    task.getIgnoreNulls(),
                     task.getUpdateKeyName()
                         .orElseThrow(
                             () -> new RuntimeException("unreachable"))); // Already validated
-            while (pageReader.nextRecord()) {
+            while (reader.nextRecord()) {
               Record record = new Record();
               UpdateKey updateKey = new UpdateKey();
               visitor.setRecord(record);
               visitor.setUpdateKey(updateKey);
-              for (Column column : pageReader.getSchema().getColumns()) {
-                column.visit(visitor);
-              }
-
-              if (updateKey.getValue() == "") {
+              reader.getSchema().visitColumns(visitor);
+              if (updateKey.getValue() == null || updateKey.getValue().toString().isEmpty()) {
+                LOGGER.warn("Record skipped because no update key value was specified");
                 continue;
               }
-
-              record.removeField(updateKey.getField());
-              updateRecords.add(new RecordForUpdate(updateKey, record));
+              updateRecords.add(
+                  new RecordForUpdate(updateKey, record.removeField(updateKey.getField())));
               if (updateRecords.size() == CHUNK_SIZE) {
                 client.record().updateRecords(task.getAppId(), updateRecords);
                 updateRecords.clear();
               }
             }
-            if (updateRecords.size() > 0) {
+            if (!updateRecords.isEmpty()) {
               client.record().updateRecords(task.getAppId(), updateRecords);
             }
           } catch (Exception e) {
@@ -185,33 +181,31 @@ public class KintonePageOutput implements TransactionalPageOutput {
           try {
             ArrayList<Record> records = new ArrayList<>();
             ArrayList<UpdateKey> updateKeys = new ArrayList<>();
-            pageReader.setPage(page);
-
+            reader.setPage(page);
             KintoneColumnVisitor visitor =
                 new KintoneColumnVisitor(
-                    pageReader,
+                    reader,
                     task.getColumnOptions(),
+                    task.getPreferNulls(),
+                    task.getIgnoreNulls(),
                     task.getUpdateKeyName()
                         .orElseThrow(
                             () -> new RuntimeException("unreachable"))); // Already validated
-            while (pageReader.nextRecord()) {
+            while (reader.nextRecord()) {
               Record record = new Record();
               UpdateKey updateKey = new UpdateKey();
               visitor.setRecord(record);
               visitor.setUpdateKey(updateKey);
-              for (Column column : pageReader.getSchema().getColumns()) {
-                column.visit(visitor);
-              }
+              reader.getSchema().visitColumns(visitor);
               records.add(record);
               updateKeys.add(updateKey);
-
               if (records.size() == UPSERT_BATCH_SIZE) {
                 upsert(records, updateKeys);
                 records.clear();
                 updateKeys.clear();
               }
             }
-            if (records.size() > 0) {
+            if (!records.isEmpty()) {
               upsert(records, updateKeys);
             }
           } catch (Exception e) {
@@ -224,22 +218,17 @@ public class KintonePageOutput implements TransactionalPageOutput {
     if (records.size() != updateKeys.size()) {
       throw new RuntimeException("records.size() != updateKeys.size()");
     }
-
     List<Record> existingRecords = getExistingRecordsByUpdateKey(updateKeys);
-
     ArrayList<Record> insertRecords = new ArrayList<>();
     ArrayList<RecordForUpdate> updateRecords = new ArrayList<>();
     for (int i = 0; i < records.size(); i++) {
       Record record = records.get(i);
       UpdateKey updateKey = updateKeys.get(i);
-
       if (existsRecord(existingRecords, updateKey)) {
-        record.removeField(updateKey.getField());
-        updateRecords.add(new RecordForUpdate(updateKey, record));
+        updateRecords.add(new RecordForUpdate(updateKey, record.removeField(updateKey.getField())));
       } else {
         insertRecords.add(record);
       }
-
       if (insertRecords.size() == CHUNK_SIZE) {
         client.record().addRecords(task.getAppId(), insertRecords);
         insertRecords.clear();
@@ -248,22 +237,29 @@ public class KintonePageOutput implements TransactionalPageOutput {
         updateRecords.clear();
       }
     }
-    if (insertRecords.size() > 0) {
+    if (!insertRecords.isEmpty()) {
       client.record().addRecords(task.getAppId(), insertRecords);
     }
-    if (updateRecords.size() > 0) {
+    if (!updateRecords.isEmpty()) {
       client.record().updateRecords(task.getAppId(), updateRecords);
     }
   }
 
   private List<Record> getExistingRecordsByUpdateKey(ArrayList<UpdateKey> updateKeys) {
-    String fieldCode = updateKeys.get(0).getField();
+    String fieldCode =
+        updateKeys.stream()
+            .map(UpdateKey::getField)
+            .filter(Objects::nonNull)
+            .findFirst()
+            .orElse(null);
+    if (fieldCode == null) {
+      return Collections.emptyList();
+    }
     List<String> queryValues =
         updateKeys.stream()
-            .filter(k -> k.getValue() != "")
-            .map(k -> "\"" + k.getValue().toString() + "\"")
+            .filter(k -> k.getValue() != null && !k.getValue().toString().isEmpty())
+            .map(k -> "\"" + k.getValue() + "\"")
             .collect(Collectors.toList());
-
     List<Record> allRecords = new ArrayList<>();
     if (queryValues.isEmpty()) {
       return allRecords;
@@ -279,7 +275,6 @@ public class KintonePageOutput implements TransactionalPageOutput {
       GetRecordsByCursorResponseBody resp = client.record().getRecordsByCursor(cursorId);
       List<Record> records = resp.getRecords();
       allRecords.addAll(records);
-
       if (!resp.hasNext()) {
         break;
       }
@@ -288,22 +283,18 @@ public class KintonePageOutput implements TransactionalPageOutput {
   }
 
   private boolean existsRecord(List<Record> distRecords, UpdateKey updateKey) {
+    if (updateKey.getValue() == null || updateKey.getValue().toString().isEmpty()) {
+      return false;
+    }
     String fieldCode = updateKey.getField();
     FieldType type = client.app().getFormFields(task.getAppId()).get(fieldCode).getType();
     switch (type) {
       case SINGLE_LINE_TEXT:
         return distRecords.stream()
-            .anyMatch(
-                d ->
-                    d.getSingleLineTextFieldValue(fieldCode)
-                        .equals(updateKey.getValue().toString()));
+            .anyMatch(d -> d.getSingleLineTextFieldValue(fieldCode).equals(updateKey.getValue()));
       case NUMBER:
         return distRecords.stream()
-            .anyMatch(
-                d ->
-                    d.getNumberFieldValue(fieldCode)
-                        .toPlainString()
-                        .equals(updateKey.getValue().toString()));
+            .anyMatch(d -> d.getNumberFieldValue(fieldCode).equals(updateKey.getValue()));
       default:
         throw new RuntimeException("The update_key must be 'SINGLE_LINE_TEXT' or 'NUMBER'.");
     }
