@@ -20,9 +20,10 @@ public class KintoneColumnVisitorVerifier {
   public KintoneColumnVisitorVerifier(
       Schema schema,
       Map<String, KintoneColumnOption> columnOptions,
+      String reduceKeyName,
       String updateKeyName,
       Page page) {
-    this(schema, columnOptions, false, false, updateKeyName, page);
+    this(schema, columnOptions, false, false, reduceKeyName, updateKeyName, page);
   }
 
   public KintoneColumnVisitorVerifier(
@@ -30,6 +31,7 @@ public class KintoneColumnVisitorVerifier {
       Map<String, KintoneColumnOption> columnOptions,
       boolean preferNulls,
       boolean ignoreNulls,
+      String reduceKeyName,
       String updateKeyName,
       Page page) {
     this.schema = schema;
@@ -38,7 +40,7 @@ public class KintoneColumnVisitorVerifier {
     pageReader.setPage(page);
     visitor =
         new KintoneColumnVisitor(
-            pageReader, columnOptions, preferNulls, ignoreNulls, updateKeyName);
+            pageReader, columnOptions, preferNulls, ignoreNulls, reduceKeyName, updateKeyName);
   }
 
   public void verify() {
