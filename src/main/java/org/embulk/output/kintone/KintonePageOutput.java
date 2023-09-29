@@ -27,7 +27,6 @@ public class KintonePageOutput implements TransactionalPageOutput {
   private static final Logger LOGGER =
       LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
   private static final int UPSERT_BATCH_SIZE = 10000;
-  private static final int CHUNK_SIZE = 100;
   private final PluginTask task;
   private final PageReader reader;
   private KintoneClient client;
@@ -114,13 +113,17 @@ public class KintonePageOutput implements TransactionalPageOutput {
             reader.setPage(page);
             KintoneColumnVisitor visitor =
                 new KintoneColumnVisitor(
-                    reader, task.getColumnOptions(), task.getPreferNulls(), task.getIgnoreNulls());
+                    reader,
+                    task.getColumnOptions(),
+                    task.getPreferNulls(),
+                    task.getIgnoreNulls(),
+                    task.getReduceKeyName().orElse(null));
             while (reader.nextRecord()) {
               Record record = new Record();
               visitor.setRecord(record);
               reader.getSchema().visitColumns(visitor);
               records.add(record);
-              if (records.size() == CHUNK_SIZE) {
+              if (records.size() == task.getChunkSize()) {
                 client.record().addRecords(task.getAppId(), records);
                 records.clear();
               }
@@ -146,6 +149,7 @@ public class KintonePageOutput implements TransactionalPageOutput {
                     task.getColumnOptions(),
                     task.getPreferNulls(),
                     task.getIgnoreNulls(),
+                    task.getReduceKeyName().orElse(null),
                     task.getUpdateKeyName()
                         .orElseThrow(
                             () -> new RuntimeException("unreachable"))); // Already validated
@@ -161,7 +165,7 @@ public class KintonePageOutput implements TransactionalPageOutput {
               }
               updateRecords.add(
                   new RecordForUpdate(updateKey, record.removeField(updateKey.getField())));
-              if (updateRecords.size() == CHUNK_SIZE) {
+              if (updateRecords.size() == task.getChunkSize()) {
                 client.record().updateRecords(task.getAppId(), updateRecords);
                 updateRecords.clear();
               }
@@ -188,6 +192,7 @@ public class KintonePageOutput implements TransactionalPageOutput {
                     task.getColumnOptions(),
                     task.getPreferNulls(),
                     task.getIgnoreNulls(),
+                    task.getReduceKeyName().orElse(null),
                     task.getUpdateKeyName()
                         .orElseThrow(
                             () -> new RuntimeException("unreachable"))); // Already validated
@@ -229,10 +234,10 @@ public class KintonePageOutput implements TransactionalPageOutput {
       } else {
         insertRecords.add(record);
       }
-      if (insertRecords.size() == CHUNK_SIZE) {
+      if (insertRecords.size() == task.getChunkSize()) {
         client.record().addRecords(task.getAppId(), insertRecords);
         insertRecords.clear();
-      } else if (updateRecords.size() == CHUNK_SIZE) {
+      } else if (updateRecords.size() == task.getChunkSize()) {
         client.record().updateRecords(task.getAppId(), updateRecords);
         updateRecords.clear();
       }
