@@ -1,6 +1,7 @@
 package org.embulk.output.kintone;
 
-import java.util.Optional;
+import java.util.Collections;
+import java.util.List;
 import org.embulk.config.TaskSource;
 
 public class KintoneColumnOptionBuilder {
@@ -42,13 +43,18 @@ public class KintoneColumnOptionBuilder {
       }
 
       @Override
-      public Optional<String> getTimezone() {
-        return Optional.ofNullable(timezone);
+      public String getTimezone() {
+        return timezone;
       }
 
       @Override
       public String getValueSeparator() {
         return valueSeparator;
+      }
+
+      @Override
+      public List<KintoneSortColumn> getSortColumns() {
+        return Collections.emptyList();
       }
 
       @Override

@@ -14,8 +14,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.embulk.config.ConfigDiff;
 import org.embulk.config.ConfigSource;
 import org.embulk.config.TaskSource;
 import org.embulk.spi.OutputPlugin;
@@ -37,17 +39,18 @@ public class TestKintoneOutputPlugin extends KintoneOutputPlugin {
           .build();
 
   @Override
+  public ConfigDiff transaction(
+      ConfigSource config, Schema schema, int taskCount, Control control) {
+    return config.get(String.class, "reduce_key", null) == null
+        ? super.transaction(config, schema, taskCount, control)
+        : transactionWithVerifier(config, schema, taskCount, control);
+  }
+
+  @Override
   public TransactionalPageOutput open(TaskSource taskSource, Schema schema, int taskIndex) {
-    String test = taskSource.get(String.class, "Domain");
-    String mode = taskSource.get(String.class, "Mode");
-    String field = taskSource.get(String.class, "UpdateKeyName");
-    return new KintonePageOutputVerifier(
-        super.open(taskSource, schema, taskIndex),
-        test,
-        field,
-        getValues(test),
-        getAddRecords(test, mode),
-        getUpdateRecords(test, mode, field));
+    return taskSource.get(String.class, "ReduceKeyName") == null
+        ? openWithVerifier(taskSource, schema, taskIndex)
+        : super.open(taskSource, schema, taskIndex);
   }
 
   protected void runOutput(String configName, String inputName) throws Exception {
@@ -89,8 +92,60 @@ public class TestKintoneOutputPlugin extends KintoneOutputPlugin {
     return embulk.configLoader().fromYamlString(string);
   }
 
-  private static List<String> getValues(String test) {
-    String name = String.format("%s/values.json", test);
+  private ConfigDiff transactionWithVerifier(
+      ConfigSource config, Schema schema, int taskCount, Control control) {
+    try (KintonePageOutputVerifier verifier = verifier(config)) {
+      return runWithMock(verifier, config, schema, taskCount, control);
+    }
+  }
+
+  private ConfigDiff runWithMock(
+      KintonePageOutputVerifier verifier,
+      ConfigSource config,
+      Schema schema,
+      int taskCount,
+      OutputPlugin.Control control) {
+    AtomicReference<ConfigDiff> configDiff = new AtomicReference<>();
+    verifier.runWithMock(
+        () -> configDiff.set(super.transaction(config, schema, taskCount, control)));
+    return configDiff.get();
+  }
+
+  private KintonePageOutputVerifier verifier(ConfigSource config) {
+    String test = config.get(String.class, "domain");
+    String mode = config.get(String.class, "mode");
+    String field = config.get(String.class, "update_key", null);
+    boolean preferNulls = config.get(boolean.class, "prefer_nulls", false);
+    boolean ignoreNulls = config.get(boolean.class, "ignore_nulls", false);
+    return new KintonePageOutputVerifier(
+        test,
+        field,
+        getValues(test, preferNulls, ignoreNulls),
+        getAddRecords(test, mode, preferNulls, ignoreNulls),
+        getUpdateRecords(test, mode, preferNulls, ignoreNulls, field));
+  }
+
+  private TransactionalPageOutput openWithVerifier(
+      TaskSource taskSource, Schema schema, int taskIndex) {
+    String test = taskSource.get(String.class, "Domain");
+    String mode = taskSource.get(String.class, "Mode");
+    String field = taskSource.get(String.class, "UpdateKeyName");
+    boolean preferNulls = taskSource.get(boolean.class, "PreferNulls");
+    boolean ignoreNulls = taskSource.get(boolean.class, "IgnoreNulls");
+    return new KintonePageOutputVerifier(
+        super.open(taskSource, schema, taskIndex),
+        test,
+        field,
+        getValues(test, preferNulls, ignoreNulls),
+        getAddRecords(test, mode, preferNulls, ignoreNulls),
+        getUpdateRecords(test, mode, preferNulls, ignoreNulls, field));
+  }
+
+  private static List<String> getValues(String test, boolean preferNulls, boolean ignoreNulls) {
+    String name =
+        String.format(
+            "%s/values%s.json",
+            test, ignoreNulls ? "_ignore_nulls" : preferNulls ? "_prefer_nulls" : "");
     String json = existsResource(name) ? readResource(name) : null;
     return json == null || json.isEmpty()
         ? Collections.emptyList()
@@ -99,8 +154,12 @@ public class TestKintoneOutputPlugin extends KintoneOutputPlugin {
             .collect(Collectors.toList());
   }
 
-  private static List<Record> getAddRecords(String test, String mode) {
-    String name = String.format("%s/%s_add_records.jsonl", test, mode);
+  private static List<Record> getAddRecords(
+      String test, String mode, boolean preferNulls, boolean ignoreNulls) {
+    String name =
+        String.format(
+            "%s/%s_add%s_records.jsonl",
+            test, mode, ignoreNulls ? "_ignore_nulls" : preferNulls ? "_prefer_nulls" : "");
     String jsonl = existsResource(name) ? readResource(name) : null;
     return jsonl == null || jsonl.isEmpty()
         ? Collections.emptyList()
@@ -109,9 +168,13 @@ public class TestKintoneOutputPlugin extends KintoneOutputPlugin {
             .collect(Collectors.toList());
   }
 
-  private static List<RecordForUpdate> getUpdateRecords(String test, String mode, String field) {
+  private static List<RecordForUpdate> getUpdateRecords(
+      String test, String mode, boolean preferNulls, boolean ignoreNulls, String field) {
     Function<Record, UpdateKey> key = getKey(field);
-    String name = String.format("%s/%s_update_records.jsonl", test, mode);
+    String name =
+        String.format(
+            "%s/%s_update%s_records.jsonl",
+            test, mode, ignoreNulls ? "_ignore_nulls" : preferNulls ? "_prefer_nulls" : "");
     String jsonl = existsResource(name) ? readResource(name) : null;
     return jsonl == null || jsonl.isEmpty()
         ? Collections.emptyList()
